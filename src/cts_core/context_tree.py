@@ -1,107 +1,104 @@
+"""The context tree shared by CTW and CTS (paper sections 2.4.3 and 3.1)."""
 from __future__ import annotations
-from typing import Optional
+
+from math import log
+from typing import Optional, Sequence
+
+from .kt_estimator import kt_prob
+
+LOG_HALF = log(0.5)
+
 
 class Node:
-    """
-    Represents a single node in the Context Tree.
+    """One node of the context tree, i.e. one context c.
 
-    Each node corresponds to a specific context (a binary suffix) and stores
-    the necessary statistics and weights for the CTS algorithm.
+    Everything is kept in natural-log space so long sequences cannot underflow.
+    The node sees only the subsequence x^c of bits that occurred in its context.
     """
+
+    __slots__ = (
+        "count_0", "count_1", "log_kt", "log_k", "log_s", "log_prob",
+        "child_0", "child_1",
+    )
+
     def __init__(self):
-        # --- Statistics for the Krichevsky-Trofimov (KT) estimator ---
-        # a_c: Count of '0's seen in this context.
+        # a_c and b_c: the number of 0s and 1s seen in this context.
         self.count_0: int = 0
-        # b_c: Count of '1's seen in this context.
         self.count_1: int = 0
-
-        # --- Weights for the Context Tree Switching (CTS) mechanism ---
-        # k_c: The weight associated with the KT estimator (the "leaf" model).
-        self.weight_k: float = 0.5
-        # s_c: The weight associated with the switched/mixed children nodes.
-        self.weight_s: float = 0.5
-
-        # --- Stored Probabilities of the sequence seen in this context ---
-        # ξ_KT(x_c,1:n_c): The total KT probability for the subsequence seen so far.
-        # Initialized to 1.0, as the probability of an empty sequence is 1.
-        self.prob_kt: float = 1.0
-        
-        # CTS_D^c(x_c,1:n_c): The total CTS probability for the subsequence.
-        # Initialized to 1.0.
-        self.prob_cts: float = 1.0
-
-        # --- Tree Structure ---
-        # Pointers to children nodes. A '0' bit traverses to child_0, '1' to child_1.
+        # ln of the KT probability of x^c. The empty sequence has probability 1.
+        self.log_kt: float = 0.0
+        # CTS only: ln k_c and ln s_c, the weights on "use KT here" and "use the
+        # children". A new node starts at k_c = s_c = 1/2.
+        self.log_k: float = LOG_HALF
+        self.log_s: float = LOG_HALF
+        # ln of the node's mixed probability of x^c: CTW^c_D or CTS^c_D.
+        self.log_prob: float = 0.0
+        # The child reached by a 0 (resp. 1) in the next-older position.
         self.child_0: Optional[Node] = None
         self.child_1: Optional[Node] = None
 
+    def observe(self, bit: int) -> float:
+        """Count `bit` in this context. Returns ln of its KT conditional probability."""
+        log_cond = log(kt_prob(bit, self.count_0, self.count_1))
+        if bit:
+            self.count_1 += 1
+        else:
+            self.count_0 += 1
+        self.log_kt += log_cond
+        return log_cond
+
+    def save(self) -> tuple:
+        """Snapshot of every field that an update can change."""
+        return (self.count_0, self.count_1, self.log_kt,
+                self.log_k, self.log_s, self.log_prob)
+
+    def restore(self, state: tuple) -> None:
+        (self.count_0, self.count_1, self.log_kt,
+         self.log_k, self.log_s, self.log_prob) = state
+
     def __repr__(self) -> str:
-        """Provides a developer-friendly string representation for debugging."""
         return (
             f"Node(counts=({self.count_0}, {self.count_1}), "
-            f"weights=({self.weight_k:.3f}, {self.weight_s:.3f}), "
-            f"probs=(kt={self.prob_kt:.3f}, cts={self.prob_cts:.3f}))"
+            f"log_kt={self.log_kt:.3f}, log_prob={self.log_prob:.3f})"
         )
-    
+
+
 class ContextTree:
-    """
-    Manages the overall Context Tree data structure.
+    """A binary tree of Nodes, created on demand as contexts are seen.
 
-    This class holds the root of the tree and provides the main interface for
-    traversing it. It dynamically creates nodes as new contexts are seen.
+    A context is the preceding bits, most recent first: x_{n-1}, x_{n-2}, ...
+    The most recent bit therefore selects the first child below the root and
+    each further bit looks one step deeper into the past.
     """
+
     def __init__(self, depth: int):
-        """
-        Initializes the Context Tree.
-
-        Args:
-            depth (int): The maximum depth D of the contexts to track.
-        """
         if depth < 0:
             raise ValueError("Tree depth cannot be negative.")
         self.depth = depth
         self.root = Node()
 
-    def get_nodes_for_context(self, context: List[int]) -> List[Node]:
+    def get_nodes_for_context(self, context: Sequence[int]) -> list[Node]:
+        """Return the nodes on the path for `context`, leaf first and root last.
+
+        `context` holds exactly `depth` bits, most recent first. Missing nodes
+        are created; a new node is in its initial state, which does not change
+        any probability.
         """
-        Traverses the tree to find or create all nodes for a given context.
-
-        This method follows the path defined by the context, creating nodes
-        if they do not exist. It returns the list of nodes along this path,
-        ordered from the deepest node (the leaf) back to the root. This is
-        the exact order required for the CTS update algorithm.
-
-        Args:
-            context (List[int]): The sequence of bits representing the context,
-                                 e.g., [1, 0, 1] for context '101'.
-
-        Returns:
-            List[Node]: A list of Node objects from leaf to root.
-        """
-        # The context is defined as x_{n-1}x_{n-2}...x_{n-D}.
-        # We only care about the last `self.depth` bits.
-        effective_context = context[-self.depth:]
-
-        current_node = self.root
-        path_nodes = [current_node]
-
-        # Traverse the tree from the root, following the path of the context.
-        for bit in effective_context:
+        if len(context) != self.depth:
+            raise ValueError(f"Context must have exactly {self.depth} bits.")
+        node = self.root
+        path = [node]
+        for bit in context:
             if bit == 0:
-                # If the child node for a '0' doesn't exist, create it.
-                if current_node.child_0 is None:
-                    current_node.child_0 = Node()
-                current_node = current_node.child_0
+                if node.child_0 is None:
+                    node.child_0 = Node()
+                node = node.child_0
             elif bit == 1:
-                # If the child node for a '1' doesn't exist, create it.
-                if current_node.child_1 is None:
-                    current_node.child_1 = Node()
-                current_node = current_node.child_1
+                if node.child_1 is None:
+                    node.child_1 = Node()
+                node = node.child_1
             else:
                 raise ValueError("Context must contain only 0s and 1s.")
-            
-            path_nodes.append(current_node)
-
-        # The paper's update rule processes nodes from the specific context
-        # back to the empty context (root). Reversing the list achieves this.
-        return path_nodes[::-1]
+            path.append(node)
+        path.reverse()
+        return path

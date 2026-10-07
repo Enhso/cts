@@ -1,0 +1,4 @@
+venv_cts
+data/calgary_corpus/
+__pycache__/
+.pytest_cache/
