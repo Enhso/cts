@@ -1,9 +1,15 @@
 import math
 import random
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 from src.cts_core.codec import HEADER, MAGIC, code_length, compress, decompress
+from src.main import main
+
+MAIN_PY = Path(__file__).resolve().parent.parent / "src" / "main.py"
 
 TEXT = (
     b"Context tree switching mixes over a strictly larger class of models than "
@@ -95,3 +101,57 @@ def test_compress_rejects_bad_arguments():
         compress(b"x", "cts", -1)
     with pytest.raises(ValueError):
         compress(b"x", "lz77", 8)
+
+
+@pytest.mark.parametrize("model", ["cts", "ctw"])
+def test_cli_compress_then_decompress_restores_the_file(tmp_path, model):
+    original, packed, restored = tmp_path / "in.txt", tmp_path / "in.cts", tmp_path / "out.txt"
+    original.write_bytes(TEXT[:400])
+    assert main(["compress", str(original), str(packed), "--model", model, "--depth", "8"]) == 0
+    assert packed.stat().st_size < 400
+    assert main(["decompress", str(packed), str(restored)]) == 0
+    assert restored.read_bytes() == original.read_bytes()
+
+
+def test_cli_handles_an_empty_file(tmp_path):
+    empty, packed, restored = tmp_path / "empty", tmp_path / "empty.cts", tmp_path / "empty.out"
+    empty.write_bytes(b"")
+    assert main(["compress", str(empty), str(packed), "--depth", "4"]) == 0
+    assert main(["decompress", str(packed), str(restored)]) == 0
+    assert restored.read_bytes() == b""
+
+
+def test_cli_reports_errors_instead_of_crashing(tmp_path):
+    junk = tmp_path / "junk"
+    junk.write_bytes(b"this is not a compressed file")
+    assert main(["decompress", str(junk), str(tmp_path / "out")]) == 1
+    assert main(["compress", str(tmp_path / "missing"), str(tmp_path / "out")]) == 1
+    assert main(["compress", str(junk), str(tmp_path / "out"), "--depth", "999"]) == 1
+
+
+def test_cli_bench_reports_bits_per_byte(tmp_path, capsys):
+    sample = tmp_path / "sample"
+    sample.write_bytes(TEXT[:300])
+    assert main(["bench", str(sample), "--depth", "8"]) == 0
+    row = capsys.readouterr().out.splitlines()[-1].split()
+    assert row[0] == "sample" and row[1] == "300"
+    ctw, cts = float(row[2]), float(row[3])
+    assert ctw == pytest.approx(code_length(TEXT[:300], "ctw", 8) / 300, abs=1e-3)
+    assert cts == pytest.approx(code_length(TEXT[:300], "cts", 8) / 300, abs=1e-3)
+
+
+def test_cli_bench_limit_uses_only_a_prefix(tmp_path, capsys):
+    sample = tmp_path / "sample"
+    sample.write_bytes(TEXT)
+    assert main(["bench", str(sample), "--depth", "4", "--limit", "100"]) == 0
+    assert capsys.readouterr().out.splitlines()[-1].split()[1] == "100"
+
+
+def test_script_runs_in_isolated_mode_from_another_directory(tmp_path):
+    original, packed, restored = tmp_path / "a", tmp_path / "a.cts", tmp_path / "a.out"
+    original.write_bytes(b"hello hello hello hello")
+    run = lambda *args: subprocess.run(
+        [sys.executable, "-I", str(MAIN_PY), *args], cwd=tmp_path, capture_output=True, text=True)
+    assert run("compress", str(original), str(packed), "--depth", "6").returncode == 0
+    assert run("decompress", str(packed), str(restored)).returncode == 0
+    assert restored.read_bytes() == original.read_bytes()
