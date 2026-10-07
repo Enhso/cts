@@ -13,6 +13,7 @@ further into the past (the paper writes these 0c and 1c).
 from __future__ import annotations
 
 import itertools
+from decimal import Decimal, localcontext
 from fractions import Fraction
 
 
@@ -98,3 +99,38 @@ def naive_cts(bits, depth, rate=lambda t: 1.0 / t):
         return result
 
     return cts((), len(bits))
+
+
+def precise_cts(bits, depth, digits=100):
+    """ln CTS_D(x_1:n) as a float, by the incremental updates of section 3.1,
+    computed with `digits`-digit decimal arithmetic instead of logarithms.
+
+    This is the same algorithm as src/cts_core/cts_model.py. It is here to show
+    that the log-space model has not drifted on sequences far longer than the
+    exhaustive tests reach: 100 digits are exact for our purposes. (Exact
+    Fractions would be better still but their size explodes beyond ~60 bits.)
+    naive_cts above is the independent check of the algorithm itself.
+    """
+    with localcontext() as ctx:
+        ctx.prec = digits
+        half, one = Decimal("0.5"), Decimal(1)
+        nodes = {}  # context -> [zeros, ones, xi_KT, k, s, CTS]
+        for t in range(1, len(bits) + 1):
+            bit = bits[t - 1]
+            alpha = one / (t + 1)
+            z = one
+            for length in range(depth, -1, -1):
+                node = nodes.setdefault(context_at(bits, t, length), [0, 0, one, half, half, one])
+                zeros, ones, xi, k, s, old = node
+                kt_cond = Decimal(2 * (ones if bit else zeros) + 1) / (2 * (zeros + ones + 1))
+                if length == depth:
+                    new = xi * kt_cond
+                else:
+                    new = k * kt_cond + s * z
+                    node[3] = alpha * new + (1 - 2 * alpha) * k * kt_cond
+                    node[4] = alpha * new + (1 - 2 * alpha) * s * z
+                node[0], node[1] = zeros + (1 - bit), ones + bit
+                node[2], node[5] = xi * kt_cond, new
+                z = new / old
+        return float(nodes[()][5].ln())
+

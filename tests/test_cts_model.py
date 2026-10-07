@@ -7,7 +7,7 @@ import pytest
 from src.cts_core import cts_model
 from src.cts_core.cts_model import CTSModel, CTWModel
 from src.cts_core.kt_estimator import KTEstimator
-from tests.naive_reference import naive_ctw, naive_cts
+from tests.naive_reference import naive_ctw, naive_cts, precise_cts
 
 MODELS = [CTWModel, CTSModel]
 NAIVE = {CTWModel: lambda bits, depth: math.log(naive_ctw(bits, depth)),
@@ -111,6 +111,28 @@ def test_constant_sequence_costs_only_logarithmically(model_cls, depth, constant
             assert lengths[n] < bound
     assert lengths[512] - lengths[256] < 1.0  # doubling the data costs under a bit
     assert lengths[8192] < 0.005 * 8192
+
+
+def text_bits(n):
+    from src.utils.io import iter_bits
+    from tests.test_integration import TEXT
+    return list(iter_bits(TEXT))[:n]
+
+
+@pytest.mark.parametrize("bits", [random_bits(400, seed=21), text_bits(400)], ids=["random", "text"])
+def test_log_space_agrees_with_high_precision_arithmetic_on_longer_sequences(bits):
+    depth = 6
+    expected_ctw = math.log(naive_ctw(bits, depth))
+    expected_cts = precise_cts(bits, depth)
+    assert run(CTWModel, depth, bits).log_joint == pytest.approx(expected_ctw, abs=1e-9)
+    assert run(CTSModel, depth, bits).log_joint == pytest.approx(expected_cts, abs=1e-9)
+
+
+def test_precise_cts_agrees_with_the_naive_recursion():
+    # Ties the high-precision incremental version to Eq. 16, where Eq. 16 is feasible.
+    for depth in (1, 2, 3):
+        for bits in itertools.islice(itertools.product((0, 1), repeat=9), 0, 512, 7):
+            assert precise_cts(list(bits), depth) == pytest.approx(math.log(naive_cts(list(bits), depth)), abs=1e-12)
 
 
 @pytest.mark.parametrize("model_cls", MODELS)
